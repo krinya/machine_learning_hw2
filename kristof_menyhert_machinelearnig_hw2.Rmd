@@ -1,0 +1,533 @@
+---
+title: "Homework Assignment 2"
+author: "Kristof Menyhert"
+date: '2018-02-02'
+output:
+  pdf_document: default
+  html_notebook:
+    df_print: paged
+  html_document:
+    df_print: paged
+subtitle: Data Science and Machine Learning 1 - CEU 2018
+---
+
+Load library and set the theme:
+
+```{r, message=FALSE, warning= FALSE}
+library(data.table)
+library(caret)
+theme_set(theme_bw()) #globally set ggplot theme to black & white
+library(knitr)
+```
+
+## 1. Predicting mental health problems in the tech sector
+
+Load the data and tidy it:
+
+```{r}
+data <- fread("C:/Users/Chronos/OneDrive - Central European University/R/machine_learning1/hw2/survey_cleaned.csv")
+
+data <- data[,c("comments", "state","work_interfere") := NULL]
+data[, age := as.numeric(age)]
+data[ , treatment := factor(treatment, levels = c("Yes", "No"))]
+```
+
+Create treatment_num variable:
+
+```{r}
+data[, treatment_num := ifelse(treatment == "Yes", 1, 0)]
+```
+
+
+#### a) Explore some predictors that can be used to predict treatment.
+
+<strong> Age vs. Treatment </strong>
+
+```{r}
+
+data_by_age <- data[,
+  .(treatment_rate = mean(treatment_num), num_obs = .N),
+  keyby = .(age_category = cut(age, breaks = seq(0, 100, by = 5),
+  include.lowest = TRUE))]
+
+ggplot(data = data_by_age, aes(x = age_category, y = treatment_rate, size = num_obs)) +
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+We can see a slightly increasing trend with age considering treatment ratio. (Maybe we could have dropped observations with age < 15, but now I am not dealing with them)
+
+<strong> Country vs. Treatment </strong>
+
+
+```{r}
+
+treament_percent <- data[, .(treatment_rate = mean(treatment_num), obs = .N), by = country]
+
+ggplot(treament_percent[obs > 20], aes(y=treatment_rate, x = country, size = obs)) + geom_point()
+
+```
+
+There are only 7 countries in the dataset with 20+ observations and among them US and UK have most of the observations, but from this graph we can see that the treatment rates are not the same.
+
+<strong> Mental and Physical vs. Treatment </strong>
+
+```{r}
+mental_ph_percent <- data[, .(treatment_rate = mean(treatment_num), obs = .N), by = mental_vs_physical]
+
+ggplot(mental_ph_percent, aes(mental_vs_physical, treatment_rate)) + geom_bar(stat = "identity")
+```
+
+Those people whose workplace are not taking mental health as seriously have the highest treatment ratio on average.
+
+#### b) Partition your data to 70% training and 30% test samples.
+```{r}
+cut <- createDataPartition(y = data$treatment, times = 1, p = 0.7, list = FALSE)
+
+data_train <- data[cut, ]
+
+data_test <- data[-cut, ]
+
+# check the cut
+length(data$treatment) == (length(data_train$treatment) + length(data_test$treatment))
+```
+
+
+#### c) Build models with glmnet and rpart that predict the binary outcome of treatment (you don’t have to use all variables if you don’t want to - experiment! Just use the same variables for both model families). Use cross-validation on the training set and use AUC as a selection measure (use metric = "ROC" in train and also don’t forget to use classProbs = TRUE, summaryFunction = twoClassSummary in  trainControl). Make sure to set the same seed before each call to train.
+
+Set Cv:
+```{r}
+set.seed(1234)
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              classProbs = TRUE,
+                              summaryFunction=twoClassSummary)
+
+```
+
+<strong>GLM model:</strong>
+```{r}
+set.seed(1234)
+glmnet_model <- train(treatment ~ age + gender + family_history + leave + supervisor + mental_vs_physical,
+                   method = "glmnet",
+                   metric = "ROC",
+                   data = data_train,
+                   trControl = train_control,
+                   tuneLength=5) # use just 5 lengh tuneLength, I could have set alpha or/and lambda manually)
+```
+
+See the results and predict outcomes:
+
+```{r}
+
+glmnet_model
+
+data_train$glm_model_prediction <- predict.train(glmnet_model, newdata = data_train)
+glm_model_prediction_percent <- predict.train(glmnet_model, newdata = data_train, type = "prob")
+data_train$glm_model_prediction_per <- glm_model_prediction_percent$Yes
+data_test$glm_model_prediction <- predict.train(glmnet_model, newdata = data_test)
+
+```
+
+<strong>Rpart model:</strong>
+
+```{r}
+
+set.seed(1234)
+tune_grid <- data.frame("cp" = c(0.0001, 0.001, 0.01, 0.1, 0.2, 0.3))
+rpart_model <- train(treatment ~ age + gender + family_history + leave + supervisor + mental_vs_physical, 
+                   data = data_train, 
+                   method = "rpart", 
+                   trControl = train_control,
+                   tuneGrid = tune_grid,
+                   metric = "ROC")
+
+```
+See the results and predict outcomes:
+
+```{r}
+rpart_model
+
+data_train$rpart_model_prediction <- predict.train(rpart_model, newdata = data_train)
+data_test$rpart_model_prediction <- predict.train(rpart_model, newdata = data_test)
+
+```
+
+
+#### d) Compare models based on their predictive performance based on the cross-validation information (you can just use the mean AUC to select the best model).
+```{r}
+compare <- data.table("mean of the ROC of the best glmnet_models" = max(glmnet_model$results$ROC),
+                      "VS" = " "  ,
+                      "mean of the ROC of the best rpart_models" = max(rpart_model$results$ROC))
+
+kable(compare)
+```
+
+glmnet model seems better, but let's observe the real predictions in a confusion matrix:
+
+For the glmnet model:
+
+```{r}
+confusionMatrix(data_train$treatment, data_train$glm_model_prediction)
+```
+
+For the rpart model:
+
+```{r}
+confusionMatrix(data_train$treatment, data_train$rpart_model_prediction)
+```
+
+#### e) Evaluate the best model on the test set: draw an ROC curve and calculate and interpret the AUC.
+
+```{r}
+test_prediction_probs <- predict.train(glmnet_model, 
+                                       newdata = data_test, 
+                                       type = "prob")
+thresholds <- seq(0, 1, by = 0.001)
+
+test_truth <- data_test$treatment
+
+true_positive_rates <- rep(0, length(thresholds)) 
+false_positive_rates <- rep(0, length(thresholds)) 
+
+for (ix in 1:length(thresholds)) {
+  thr <- thresholds[ix]
+  test_prediction <- ifelse(test_prediction_probs$Yes > thr, "Yes", "No")
+  test_prediction <- factor(test_prediction, levels = c("Yes", "No"))
+  cm <- as.matrix(confusionMatrix(test_prediction, test_truth))
+  true_positive_rates[ix] <- cm[1, 1] / (cm[1, 1] + cm[2, 1])
+  false_positive_rates[ix] <- cm[1, 2] / (cm[1, 2] + cm[2, 2])
+} 
+
+manual_roc <- data.table("threshold" = thresholds,
+                         "true_positive_rate" = true_positive_rates,
+                         "false_positive_rate" = false_positive_rates)
+ggplot(data = manual_roc, 
+       aes(x = false_positive_rate,
+           y = true_positive_rate,
+           color = threshold)) +
+  geom_line(size = 1.3) + geom_abline(slope = 1, color = "black", linetype = 2) +
+  labs(x="False Positive Rate", y="True Positive Rate")+ ggtitle("ROC")
+```
+```{r,  message=FALSE, warning= FALSE}
+
+library(ROCR)
+rocr_prediction <- prediction(test_prediction_probs$Yes,
+                              data_test$treatment)
+# built-in plot method
+plot(performance(rocr_prediction, "tpr", "fpr"), colorize=TRUE) 
+```
+
+```{r}
+AUC <- performance(rocr_prediction, "auc")
+print(AUC@y.values[[1]])
+```
+
+
+#### f) If you have to choose a probability threshold to predict the outcome, what would you choose? At this threshold, how large are the true positive rate and the false positive rate? How many false positives and false negatives there are in the test sample?
+
+I would choose the north-weest corner of the curve around the threshold of around 0.4.  
+* the true positive rate would be around 0.63  
+* the false positive rate would e around 0.28
+```{r}
+confusionMatrix(data_test$treatment, predict.train(glmnet_model, newdata = data_test))
+```
+
+## 2. Transformed scores
+
+Take the medical appointment no-show dataset we used in class and apply all the cleaning steps we did, then create a training and a test set.
+Estimate a predictive model of your choice for no_show as a target variable.
+Get predicted scores (probabilities). 
+Then calculate two transformations of the scores: take the square root and the square of the probabilities. These are valid scores as well, they are also between 0 and 1 so they can be used for classification.
+
+Load the required packages and set the theme black and white:
+```{r,  message=FALSE, warning= FALSE}
+library(ggplot2)
+library(data.table)
+library(caret)
+library(glmnet)
+library(ROCR)
+
+theme_set(theme_bw())
+```
+
+
+Load the data and do the transformations what we did in the class:
+```{r}
+data <- fread("C:/Users/Chronos/OneDrive - Central European University/R/machine_learning1/hw2/no-show-data.csv")
+
+# [... apply the cleaning steps we did in class ...]:
+# some data cleaning
+data[, c("PatientId", "AppointmentID", "Neighbourhood") := NULL]
+setnames(data, 
+         c("No-show", 
+           "Age", 
+           "Gender",
+           "ScheduledDay", 
+           "AppointmentDay",
+           "Scholarship",
+           "Hipertension",
+           "Diabetes",
+           "Alcoholism",
+           "Handcap",
+           "SMS_received"), 
+         c("no_show", 
+           "age", 
+           "gender", 
+           "scheduled_day", 
+           "appointment_day",
+           "scholarship",
+           "hypertension",
+           "diabetes",
+           "alcoholism",
+           "handicap",
+           "sms_received"))
+
+# clean up a little bit
+data <- data[age %between% c(0, 95)]
+# for binary prediction with caret, the target variable must be a factor
+data[, no_show := factor(no_show, levels = c("Yes", "No"))]
+data[, no_show_num := ifelse(no_show == "Yes", 1, 0)]
+data[, handicap := ifelse(handicap > 0, 1, 0)]
+
+# create new variables
+data[, scheduled_day := as.Date(scheduled_day)]
+data[, appointment_day := as.Date(appointment_day)]
+data[, days_since_scheduled := as.integer(appointment_day - scheduled_day)]
+data <- data[days_since_scheduled > -1]
+
+
+#one more:
+data[, days_category := cut(
+  days_since_scheduled, 
+  breaks = c(-1, 0, 1, 2, 5, 10, 30, Inf), 
+  include.lowest = TRUE)]
+```
+
+Split the data:
+
+```{r}
+# [... create train and test sets ... ]
+cut <- createDataPartition(y = data$no_show, times = 1, p = 0.7, list = FALSE)
+
+data_train <- data[cut, ]
+
+data_test <- data[-cut, ]
+
+# check the cut
+length(data$no_show) == (length(data_train$no_show) + length(data_test$no_show))
+```
+
+Create a model:
+
+```{r}
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              classProbs = TRUE,
+                              verboseIter = TRUE,
+                              summaryFunction = twoClassSummary)
+
+tune_grid <- expand.grid("alpha" = c(0, 0.25, 0.5, 0.75, 1),
+                         "lambda" = c(0.01, 0.001, 0.0001))
+
+model <- train(no_show ~ days_category +
+                 poly(age, 3) +
+                 scholarship +
+                 gender +
+                 alcoholism +
+                 diabetes,
+               data = data_train, method = "glmnet", preProcess = c("center", "scale"),
+               trControl = train_control, tuneGrid = tune_grid, metric = "ROC")
+
+```
+```{r}
+model
+```
+
+
+
+```{r}
+prediction <- predict.train(model, newdata = data_test, type = "prob")
+prediction_sqrt <- sqrt(prediction)
+prediction_sq <- prediction^2
+
+prediction_sq <- data.table(prediction_sq)
+```
+
+
+#### a) Draw ROC curves for all three scores and calculate the AUC. How do they compare? Is it surprising in light of the interpretation of the AUC?
+
+```{r}
+thresholds <- seq(0, 1, by = 0.001)
+
+test_truth <- data_test$no_show
+
+true_positive_rates <- rep(0, length(thresholds)) 
+false_positive_rates <- rep(0, length(thresholds))
+
+true_positive_rates_sqrt <- rep(0, length(thresholds)) 
+false_positive_rates_sqrt <- rep(0, length(thresholds))
+
+true_positive_rates_sq <- rep(0, length(thresholds)) 
+false_positive_rates_sq <- rep(0, length(thresholds))
+
+for (ix in 1:length(thresholds)) {
+  thr <- thresholds[ix]
+  test_prediction <- ifelse(prediction$Yes > thr, "Yes", "No")
+  test_prediction <- factor(test_prediction, levels = c("Yes", "No"))
+  
+  test_prediction_sqrt <- ifelse(prediction_sqrt$Yes > thr, "Yes", "No")
+  test_prediction_sqrt <- factor(test_prediction_sqrt, levels = c("Yes", "No"))
+  
+  test_prediction_sq <- ifelse(prediction_sq$Yes > thr, "Yes", "No")
+  test_prediction_sq <- factor(test_prediction_sq, levels = c("Yes", "No"))
+  
+  cm <- as.matrix(confusionMatrix(test_prediction, test_truth))
+  cm2 <- as.matrix(confusionMatrix(test_prediction_sqrt, test_truth))
+  cm3 <- as.matrix(confusionMatrix(test_prediction_sq, test_truth))
+  
+  true_positive_rates[ix] <- cm[1, 1] / (cm[1, 1] + cm[2, 1])
+  false_positive_rates[ix] <- cm[1, 2] / (cm[1, 2] + cm[2, 2])
+  
+  true_positive_rates_sqrt[ix] <- cm2[1, 1] / (cm2[1, 1] + cm2[2, 1])
+  false_positive_rates_sqrt[ix] <- cm2[1, 2] / (cm2[1, 2] + cm2[2, 2])
+  
+  true_positive_rates_sq[ix] <- cm3[1, 1] / (cm3[1, 1] + cm3[2, 1])
+  false_positive_rates_sq[ix] <- cm3[1, 2] / (cm3[1, 2] + cm3[2, 2])
+} 
+
+manual_roc <- data.table("threshold" = thresholds,
+                         "true_positive_rate" = true_positive_rates,
+                         "false_positive_rate" = false_positive_rates,
+                         "true_positive_rate_sqrt" = true_positive_rates_sqrt ,
+                         "false_positive_rate_sqrt" = false_positive_rates_sqrt ,
+                         "true_positive_rate_sq"= true_positive_rates_sq,
+                         "false_positive_rate_sq" = false_positive_rates_sq)
+
+roc1 <- data.table("threshold" = thresholds,
+                   "true_positive_rate" = true_positive_rates,
+                   "false_positive_rate" = false_positive_rates,
+                   "type" = "simple")
+
+roc2 <- data.table("threshold" = thresholds,
+                   "true_positive_rate" = true_positive_rates_sqrt,
+                   "false_positive_rate" = false_positive_rates_sqrt,
+                   "type" = "sqrt")
+
+roc3 <- data.table("threshold" = thresholds,
+                   "true_positive_rate"= true_positive_rates_sq,
+                   "false_positive_rate" = false_positive_rates_sq,
+                   "type" = "sq")
+
+roc_all <- rbind(roc1, roc2, roc3)
+
+
+ggplot(data = roc_all, 
+       aes(x = false_positive_rate,
+           y = true_positive_rate,
+           color = type)) +
+  geom_line(size = 1.2, alpha = 0.5) +
+  geom_abline(slope = 1, color = "black", linetype = 2) +
+  labs(x="False Positive Rate",
+       y="True Positive Rate") +
+  ggtitle("ROC for Simple, Sq and Sqrt predicted probabilities")
+
+```
+
+All the ROC cuvres are overlaping/same.
+
+We can do the same as above just with the ROCR library separately:
+
+```{r}
+library(ROCR)
+rocr_prediction <- prediction(prediction$Yes, test_truth)
+# built-in plot method
+plot(performance(rocr_prediction, "tpr", "fpr"), colorize=TRUE)
+
+rocr_prediction_sqrt <- prediction(prediction_sqrt$Yes, test_truth)
+# built-in plot method
+plot(performance(rocr_prediction_sqrt, "tpr", "fpr"), colorize=TRUE)
+
+rocr_prediction_sq <- prediction(prediction_sq$Yes, test_truth)
+# built-in plot method
+plot(performance(rocr_prediction_sq, "tpr", "fpr"), colorize=TRUE)
+```
+
+We also should notice that the plotted ROCs are the same, but the thresholds are changed on each of  the graphs.
+
+#### b) What is the key, common property of both the square root and the square functions that leads to this finding?
+
+Both (sqrt and sq) of them are not linear transformations. So the big values and the small values are not getting the same effect by executing sqrt and sq function on them. That is the reason why the thresholds are different.
+
+However we are not able to get a different separation, since the ROC function is monotone and the transformation does not change the 'order' of the predicted probabilities.
+
+#### c) Draw a calibration plot for all three scores separately:  
+* group people into bins based on predicted scores  
+* display on a scatter plot the mean of the predicted scores versus the actual share of people surviving  
+
+```{r}
+data_test[, prediction_normal := prediction$Yes]
+data_test[, prediction_sqrt := prediction_sqrt$Yes]
+data_test[, prediction_sq := prediction_sq$Yes]
+```
+Normal probabilities:
+```{r}
+deciles <- quantile(data_test$prediction_normal, prob = seq(0, 1, length = 11))
+
+group <- cut(data_test$prediction_normal, deciles, include.lowest = TRUE)
+
+data_test[, prediction_normal_group := group]
+
+calibrateplot <- data_test[, .(N = .N, true_mean_no_show = mean(no_show_num), predicted_mean_no_show = mean(prediction_normal)), by = prediction_normal_group]
+
+ggplot(calibrateplot, aes(x= true_mean_no_show, y=predicted_mean_no_show)) +
+  geom_point(size = 3, color = "red") +
+  geom_text(aes(label=prediction_normal_group),hjust=-0.1, vjust=0) +
+  geom_abline(slope = 1, linetype = 2) +
+  coord_cartesian(xlim = c(0, 0.5), ylim = c(0,0.5)) +
+  labs(x="True ration of no_show", y="Predicted no_show_ratio") +
+  ggtitle("Calibration plot (normal)")
+```
+Sqrt probabilities:
+```{r}
+deciles <- quantile(data_test$prediction_sqrt, prob = seq(0, 1, length = 11))
+
+group <- cut(data_test$prediction_sqrt, deciles, include.lowest = TRUE)
+
+data_test[, prediction_sqrt_group := group]
+
+calibrateplot_sqrt <- data_test[, .(N = .N, true_mean_no_show = mean(no_show_num), predicted_mean_no_show = mean(prediction_sqrt)), by = prediction_sqrt_group]
+
+ggplot(calibrateplot_sqrt, aes(x= true_mean_no_show^0.5, y=predicted_mean_no_show)) +
+  geom_point(size = 3, color = "orange") +
+  geom_abline(slope = 1, linetype = 2) +
+  geom_text(aes(label=prediction_sqrt_group),hjust=-0.1, vjust=0) + 
+  coord_cartesian(xlim = c(0, 0.7), ylim = c(0,0.7)) + 
+  labs(x="(True ration of no_show)^0.5", y="Predicted no_show_ratio") +
+  ggtitle("Calibration plot (sqrt)")
+```
+Sq probabilities:
+```{r}
+deciles <- quantile(data_test$prediction_sq, prob = seq(0, 1, length = 11))
+
+group <- cut(data_test$prediction_sq, deciles, include.lowest = TRUE)
+
+data_test[, prediction_sq_group := group]
+
+calibrateplot_sq <- data_test[, .(N = .N, true_mean_no_show = mean(no_show_num), predicted_mean_no_show = mean(prediction_sq)), by = prediction_sq_group]
+
+ggplot(calibrateplot_sq, aes(x= true_mean_no_show^2, y=predicted_mean_no_show)) +
+  geom_point(size = 3, color = "blue") +
+  geom_abline(slope = 1, linetype = 2) +
+  geom_text(aes(label=prediction_sq_group),hjust=-0.1, vjust=0) +
+  coord_cartesian(xlim = c(0, 0.2), ylim = c(0,0.2)) +
+  labs(x="(True ration of no_show)^2", y="Predicted no_show_ratio") +
+  ggtitle("Calibration plot (sq)")
+```
+
+#### How do they compare? Which score(s) can be regarded as well-calibrated probabilites?
+
+I would say that all the methods are well-calibrated and there are only small differences. Since the difference between the results is negligible I found that there is no point in deciding which is the most well-calibrated method.
+
+But, if I had to make a decision I would choose the sqrt probabilities method for the calibration.
